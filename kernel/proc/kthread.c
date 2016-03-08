@@ -1,3 +1,21 @@
+/******************************************************************************/
+/* Important Spring 2016 CSCI 402 usage information:                          */
+/*                                                                            */
+/* This fils is part of CSCI 402 kernel programming assignments at USC.       */
+/*         53616c7465645f5f2e8d450c0c5851acd538befe33744efca0f1c4f9fb5f       */
+/*         3c8feabc561a99e53d4d21951738da923cd1c7bbd11b30a1afb11172f80b       */
+/*         984b1acfbbf8fae6ea57e0583d2610a618379293cb1de8e1e9d07e6287e8       */
+/*         de7e82f3d48866aa2009b599e92c852f7dbf7a6e573f1c7228ca34b9f368       */
+/*         faaef0c0fcf294cb                                                   */
+/* Please understand that you are NOT permitted to distribute or publically   */
+/*         display a copy of this file (or ANY PART of it) for any reason.    */
+/* If anyone (including your prospective employer) asks you to post the code, */
+/*         you must inform them that you do NOT have permissions to do so.    */
+/* You are also NOT permitted to remove or alter this comment block.          */
+/* If this comment block is removed or altered in a submitted file, 20 points */
+/*         will be deducted.                                                  */
+/******************************************************************************/
+
 #include "config.h"
 #include "globals.h"
 
@@ -63,6 +81,17 @@ free_stack(char *stack)
         page_free_n(stack, 1 + (DEFAULT_STACK_SIZE >> PAGE_SHIFT));
 }
 
+void
+kthread_destroy(kthread_t *t)
+{
+        KASSERT(t && t->kt_kstack);
+        free_stack(t->kt_kstack);
+        if (list_link_is_linked(&t->kt_plink))
+                list_remove(&t->kt_plink);
+
+        slab_obj_free(kthread_allocator, t);
+}
+
 /*
  * Allocate a new stack with the alloc_stack function. The size of the
  * stack is DEFAULT_STACK_SIZE.
@@ -74,47 +103,32 @@ free_stack(char *stack)
 kthread_t *
 kthread_create(struct proc *p, kthread_func_t func, long arg1, void *arg2)
 {
-    kthread_t *k = slab_obj_alloc(kthread_allocator);
+	/* allocate the memory for the thread. */
+	kthread_t * newThr = slab_obj_alloc(kthread_allocator);
+	if (newThr == NULL) {
+		return NULL;
+	}
+	
+	/* allocate the stack for the thread. */
+	newThr->kt_kstack = alloc_stack();
+	if (newThr->kt_kstack == NULL) {
+		slab_obj_free(kthread_allocator, newThr);
+		return NULL;
+	}
 
-    if (k == NULL){
-        return NULL;
-    }
-
-    char *kstack = alloc_stack();
-
-    if (kstack == NULL){
-        slab_obj_free(kthread_allocator, k);
-        return NULL;
-    }
-    
-    k->kt_kstack = kstack;
-
-    k->kt_proc = p;
-
-    k->kt_cancelled = 0;
-    k->kt_wchan = NULL;
-    k->kt_state = KT_NO_STATE;
-
-    list_link_init(&k->kt_qlink);
-
-    list_link_init(&k->kt_plink);
-    list_insert_head(&p->p_threads, &k->kt_plink);
-
-    context_setup(&k->kt_ctx, func, arg1, arg2, k->kt_kstack, 
-            DEFAULT_STACK_SIZE, p->p_pagedir);    
-
-    return k;
-}
-
-void
-kthread_destroy(kthread_t *t)
-{
-        KASSERT(t && t->kt_kstack);
-        free_stack(t->kt_kstack);
-        if (list_link_is_linked(&t->kt_plink))
-                list_remove(&t->kt_plink);
-
-        slab_obj_free(kthread_allocator, t);
+	/* initialize the parameter for the thread. */
+	newThr->kt_proc = p;
+	newThr->kt_cancelled = 0;
+	newThr->kt_wchan = NULL;
+	newThr->kt_state = KT_NO_STATE;		/* should be made to runnable at the process level. */
+	
+	/* initialize the related lists for the thread. */
+	list_link_init(&newThr->kt_qlink);
+	list_link_init(&newThr->kt_plink);
+	list_insert_head(&p->p_threads, &newThr->kt_plink);
+	context_setup(&newThr->kt_ctx, func, arg1, arg2, newThr->kt_kstack, DEFAULT_STACK_SIZE, p->p_pagedir);
+	
+        return newThr;
 }
 
 /*
@@ -131,27 +145,18 @@ kthread_destroy(kthread_t *t)
 void
 kthread_cancel(kthread_t *kthr, void *retval)
 {
-    if (kthr == curthr){
-        KASSERT(kthr->kt_state == KT_RUN);
-        kthread_exit(retval);
-    } else {
-        /*KASSERT(kthr->kt_state == KT_SLEEP || kthr->kt_state == KT_SLEEP_CANCELLABLE);*/
-
-        kthr->kt_cancelled = 1;
-        kthr->kt_retval = retval;
-
-        if (kthr->kt_state == KT_SLEEP_CANCELLABLE){
-            sched_wakeup_on(kthr->kt_wchan);
-        }
-    }
+	if (kthr == curthr) {
+		kthread_exit(retval);	
+	} else {
+		kthr->kt_retval = retval;
+		sched_cancel(kthr);
+	}
 }
 
 /*
- * You need to set the thread's retval field and alert the current
- * process that a thread is exiting via proc_thread_exited. You should
- * refrain from setting the thread's state to KT_EXITED until you are
- * sure you won't make any more blocking calls before you invoke the
- * scheduler again.
+ * You need to set the thread's retval field, set its state to
+ * KT_EXITED, and alert the current process that a thread is exiting
+ * via proc_thread_exited.
  *
  * It may seem unneccessary to push the work of cleaning up the thread
  * over to the process. However, if you implement MTP, a thread
@@ -159,10 +164,12 @@ kthread_cancel(kthread_t *kthr, void *retval)
  * cleaned up.
  */
 void
-kthread_exit(void *retval){
-    curthr->kt_retval = retval;
-    curthr->kt_state = KT_EXITED;
-    proc_thread_exited(retval);
+kthread_exit(void *retval)
+{
+	/* simply change the current thread's state, set the return value and alert the curproc. */
+	curthr->kt_state = KT_EXITED;
+	curthr->kt_retval = retval;	
+	proc_thread_exited(retval);
 }
 
 /*
@@ -173,41 +180,10 @@ kthread_exit(void *retval){
  * You do not need to worry about this until VM.
  */
 kthread_t *
-kthread_clone(kthread_t *oldthr)
+kthread_clone(kthread_t *thr)
 {
-    kthread_t *newthr = slab_obj_alloc(kthread_allocator);
-
-    if (newthr == NULL){
+        NOT_YET_IMPLEMENTED("VM: kthread_clone");
         return NULL;
-    }
-
-    char *kstack = alloc_stack();
-
-    if (kstack == NULL){
-        slab_obj_free(kthread_allocator, newthr);
-        return NULL;
-    }
-    
-    newthr->kt_kstack = kstack;
-
-    newthr->kt_retval = oldthr->kt_retval;
-    newthr->kt_errno = oldthr->kt_errno;
-    newthr->kt_proc = NULL;
-
-    newthr->kt_cancelled = oldthr->kt_cancelled;
-
-    KASSERT(oldthr->kt_wchan == NULL);
-    newthr->kt_wchan = oldthr->kt_wchan;
-
-    KASSERT(oldthr->kt_state == KT_RUN);
-    newthr->kt_state = oldthr->kt_state;
-
-    KASSERT(!list_link_is_linked(&oldthr->kt_qlink));
-    list_link_init(&newthr->kt_qlink);
-
-    list_link_init(&newthr->kt_plink);
-
-    return newthr;
 }
 
 /*
@@ -218,7 +194,6 @@ kthread_clone(kthread_t *oldthr)
 #ifdef __MTP__
 int
 kthread_detach(kthread_t *kthr)
-
 {
         NOT_YET_IMPLEMENTED("MTP: kthread_detach");
         return 0;

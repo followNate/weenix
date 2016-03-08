@@ -1,3 +1,21 @@
+/******************************************************************************/
+/* Important Spring 2016 CSCI 402 usage information:                          */
+/*                                                                            */
+/* This fils is part of CSCI 402 kernel programming assignments at USC.       */
+/*         53616c7465645f5f2e8d450c0c5851acd538befe33744efca0f1c4f9fb5f       */
+/*         3c8feabc561a99e53d4d21951738da923cd1c7bbd11b30a1afb11172f80b       */
+/*         984b1acfbbf8fae6ea57e0583d2610a618379293cb1de8e1e9d07e6287e8       */
+/*         de7e82f3d48866aa2009b599e92c852f7dbf7a6e573f1c7228ca34b9f368       */
+/*         faaef0c0fcf294cb                                                   */
+/* Please understand that you are NOT permitted to distribute or publically   */
+/*         display a copy of this file (or ANY PART of it) for any reason.    */
+/* If anyone (including your prospective employer) asks you to post the code, */
+/*         you must inform them that you do NOT have permissions to do so.    */
+/* You are also NOT permitted to remove or alter this comment block.          */
+/* If this comment block is removed or altered in a submitted file, 20 points */
+/*         will be deducted.                                                  */
+/******************************************************************************/
+
 #include "globals.h"
 #include "errno.h"
 
@@ -11,7 +29,7 @@
 
 static ktqueue_t kt_runq;
 
-__attribute__((unused)) void
+static __attribute__((unused)) void
 sched_init(void)
 {
         sched_queue_init(&kt_runq);
@@ -100,9 +118,12 @@ sched_queue_empty(ktqueue_t *q)
 void
 sched_sleep_on(ktqueue_t *q)
 {
-    curthr->kt_state = KT_SLEEP;
-    ktqueue_enqueue(q, curthr);
-    sched_switch();
+	/* change the current thread's state to uncancellable sleep and enqueue it. */
+	curthr->kt_state = KT_SLEEP;
+	ktqueue_enqueue(q, curthr);
+	curthr->kt_wchan = q;
+	/* switch to the next thread. */
+	sched_switch();
 }
 
 
@@ -116,39 +137,39 @@ sched_sleep_on(ktqueue_t *q)
 int
 sched_cancellable_sleep_on(ktqueue_t *q)
 {
-    curthr->kt_state = KT_SLEEP_CANCELLABLE;
-    ktqueue_enqueue(q, curthr);
-    sched_switch();
+	/* similar to sleep_on. */
+        curthr->kt_state = KT_SLEEP_CANCELLABLE;
+	ktqueue_enqueue(q, curthr);
+	curthr->kt_wchan = q;
+	sched_switch();
 
-    if (curthr->kt_cancelled == 1){
-        return -EINTR;
-    } else {
-        return 0;
-    }
+	/* return -EINTR if the thread was cancelled and 0 otherwise */
+	if (curthr->kt_cancelled == 1) {
+		return -EINTR;
+	} else {
+        	return 0;	
+	}
 }
 
 kthread_t *
 sched_wakeup_on(ktqueue_t *q)
 {
-    if (q->tq_size == 0){
-        return NULL;
-    } else {
-        kthread_t *t = ktqueue_dequeue(q);
-        KASSERT(t != NULL);
-
-        sched_make_runnable(t);
-
-        return t;
-    }
+	/* return NULL if q is empty. */
+        if (sched_queue_empty(q)) {
+        	return NULL;
+	}
+	
+	/* wake up one thread from the queue and make it runnable. */
+	kthread_t * tempThr = ktqueue_dequeue(q);
+	KASSERT(tempThr != NULL);	/* if it is null, make_runnable would crush. */
+	sched_make_runnable(tempThr);
+	return tempThr;
 }
 
 void
 sched_broadcast_on(ktqueue_t *q)
 {
-    while (q->tq_size > 0){
-        kthread_t *t = ktqueue_dequeue(q);
-        sched_make_runnable(t);
-    }
+	while (sched_wakeup_on(q) != NULL);
 }
 
 /*
@@ -163,14 +184,18 @@ sched_broadcast_on(ktqueue_t *q)
 void
 sched_cancel(struct kthread *kthr)
 {
-    kthr->kt_cancelled = 1;
+	KASSERT(kthr != NULL);
+	kthr->kt_cancelled = 1;
 
-    KASSERT(kthr->kt_state == KT_SLEEP_CANCELLABLE || kthr->kt_state == KT_SLEEP);
+	/* the thread would be in some queue unless it is in the KT_NO_STATE or KT_EXITED state */
+	KASSERT(kthr->kt_state != KT_NO_STATE && kthr->kt_state != KT_EXITED);
 
-    if (kthr->kt_state == KT_SLEEP_CANCELLABLE){
-        ktqueue_remove(kthr->kt_wchan, kthr);
-        sched_make_runnable(kthr);
-    } 
+	/* if the thread's sleep is cancellable, remove it from it's queue. */
+	if (curthr->kt_state == KT_SLEEP_CANCELLABLE) {
+		ktqueue_t * q = kthr->kt_wchan;
+		ktqueue_remove(q, kthr);
+		sched_make_runnable(kthr);
+	}
 }
 
 /*
@@ -212,31 +237,31 @@ sched_cancel(struct kthread *kthr)
 void
 sched_switch(void)
 {
-    uint8_t orig_ipl = intr_getipl();
+      	/* mask the interrupts first. */
+	uint8_t oldIPL = intr_getipl();
+	intr_setipl(IPL_HIGH);
 
-    intr_setipl(IPL_HIGH);
+	/* if there are no threads on the run Q, wait for an interrupt. */
+	while (sched_queue_empty(&kt_runq)) {
+		intr_setipl(IPL_LOW);
+		intr_wait();
+		intr_setipl(IPL_HIGH);
+	}
+	
+	/* dequeue a thread from the running Q */
+	kthread_t * nextThr;
+	kthread_t * oldCur;
+	KASSERT(!sched_queue_empty(&kt_runq));
+	nextThr = ktqueue_dequeue(&kt_runq);	
 
-    while (sched_queue_empty(&kt_runq)){
-        intr_disable();
-        intr_setipl(IPL_LOW);
-        intr_wait();
-        intr_setipl(IPL_HIGH);
-    }
-
-    /* make sure the interrupt actually led o
-     * someone being on the run queue. If this ever fails,
-     * we may need a while loop
-     */
-    KASSERT(!sched_queue_empty(&kt_runq));
-
-    context_t *old_ctx = &curthr->kt_ctx;
-
-    curthr = ktqueue_dequeue(&kt_runq); 
-
-    curproc = curthr->kt_proc;
-
-    context_switch(old_ctx, &curthr->kt_ctx);
-    intr_setipl(orig_ipl);
+	/* set the new current thread and process. and switch context. */
+	oldCur = curthr;
+	curthr = nextThr;
+	curproc = curthr->kt_proc;
+	context_switch(&oldCur->kt_ctx, &curthr->kt_ctx);
+	
+	/* unblock the interrupts. */
+	intr_setipl(oldIPL);
 }
 
 /*
@@ -255,12 +280,15 @@ sched_switch(void)
 void
 sched_make_runnable(kthread_t *thr)
 {
-    uint8_t orig_ipl = intr_getipl();
+       	/* mask the interrupts first. */
+	uint8_t oldIPL = intr_getipl();
+	intr_setipl(IPL_HIGH);
 
-    intr_setipl(IPL_HIGH);
-
-    thr->kt_state = KT_RUN;
-    ktqueue_enqueue(&kt_runq, thr);
-
-    intr_setipl(orig_ipl);
+	/* put the thread into the run Q. */
+	thr->kt_state = KT_RUN;
+	ktqueue_enqueue(&kt_runq, thr);	
+	thr->kt_wchan = &kt_runq;
+	
+	/* unblock the interrupts. */
+	intr_setipl(oldIPL);
 }

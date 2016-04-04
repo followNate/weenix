@@ -1,9 +1,27 @@
+/******************************************************************************/
+/* Important Spring 2016 CSCI 402 usage information:                          */
+/*                                                                            */
+/* This fils is part of CSCI 402 kernel programming assignments at USC.       */
+/*         53616c7465645f5f2e8d450c0c5851acd538befe33744efca0f1c4f9fb5f       */
+/*         3c8feabc561a99e53d4d21951738da923cd1c7bbd11b30a1afb11172f80b       */
+/*         984b1acfbbf8fae6ea57e0583d2610a618379293cb1de8e1e9d07e6287e8       */
+/*         de7e82f3d48866aa2009b599e92c852f7dbf7a6e573f1c7228ca34b9f368       */
+/*         faaef0c0fcf294cb                                                   */
+/* Please understand that you are NOT permitted to distribute or publically   */
+/*         display a copy of this file (or ANY PART of it) for any reason.    */
+/* If anyone (including your prospective employer) asks you to post the code, */
+/*         you must inform them that you do NOT have permissions to do so.    */
+/* You are also NOT permitted to remove or alter this comment block.          */
+/* If this comment block is removed or altered in a submitted file, 20 points */
+/*         will be deducted.                                                  */
+/******************************************************************************/
+
 /*
  *  FILE: vfs_syscall.c
  *  AUTH: mcc | jal
  *  DESC:
  *  DATE: Wed Apr  8 02:46:19 1998
- *  $Id: vfs_syscall.c,v 1.9.2.2 2006/06/04 01:02:32 afenn Exp $
+ *  $Id: vfs_syscall.c,v 1.13 2015/12/15 14:38:24 william Exp $
  */
 
 #include "kernel.h"
@@ -22,14 +40,9 @@
 #include "fs/stat.h"
 #include "util/debug.h"
 
-#define KMUTEX_STATIC_INITIALIZER(name) {{{&name.km_waitq.tq_list,\
-    &name.km_waitq.tq_list}, 0}, NULL}
-
-static kmutex_t lookup_mutex = KMUTEX_STATIC_INITIALIZER(lookup_mutex);
-
 /* To read a file:
  *      o fget(fd)
- *      o call its virtual read f_op
+ *      o call its virtual read fs_op
  *      o update f_pos
  *      o fput() it
  *      o return the number of bytes read, or an error
@@ -46,50 +59,40 @@ static kmutex_t lookup_mutex = KMUTEX_STATIC_INITIALIZER(lookup_mutex);
 int
 do_read(int fd, void *buf, size_t nbytes)
 {
-    if (fd < 0 || fd >= NFILES){
-        return -EBADF;
-    }
+        /*************** kernel 2 ***************/
+		file_t *f = fget(fd);
+		if (!f) {
+			return -EBADF;
+		}
 
-    file_t *f = fget(fd);
+		if (!(f->f_mode & FMODE_READ)) {
+			fput(f);
+			return -EBADF;
+		}
 
-    if (f == NULL){
-        return -EBADF;
-    } else if (!(f->f_mode & FMODE_READ)){
-        fput(f);
-        return -EBADF;
-    }
+		if (f->f_vnode->vn_mode == S_IFDIR) {
+			fput(f);
+			return -EISDIR;
+		}
 
-    if (f->f_vnode->vn_ops->read == NULL){
-        fput(f);
-        return -EISDIR;
-    }
+		int bytes = f->f_vnode->vn_ops->read(f->f_vnode, f->f_pos, buf, nbytes);
+		
+		/* Update f_pos based on whether end-of-file is reached */
+		if (!bytes && nbytes) {
+			f->f_pos = f->f_vnode->vn_len;
+		} else {
+			f->f_pos += bytes;
+		}
 
-    int bytes_read = f->f_vnode->vn_ops->read(f->f_vnode, f->f_pos, buf, nbytes);
+		fput(f);
 
-    int ret_val = bytes_read;
-
-    if (bytes_read == 0 && nbytes != 0){
-        int seek_val = do_lseek(fd, 0, SEEK_END);
-
-        if (seek_val < 0){
-            ret_val = seek_val;
-        }
-
-    } else if (bytes_read > 0){
-        int seek_val = do_lseek(fd, bytes_read, SEEK_CUR);
-
-        if (seek_val < 0){
-            ret_val = seek_val;
-        }
-    }
-
-    fput(f);
-    return ret_val;
+		return bytes;
+		/*************** kernel 2 ***************/
 }
 
 /* Very similar to do_read.  Check f_mode to be sure the file is writable.  If
  * f_mode & FMODE_APPEND, do_lseek() to the end of the file, call the write
- * f_op, and fput the file.  As always, be mindful of refcount leaks.
+ * fs_op, and fput the file.  As always, be mindful of refcount leaks.
  *
  * Error cases you must handle for this function at the VFS level:
  *      o EBADF
@@ -98,42 +101,27 @@ do_read(int fd, void *buf, size_t nbytes)
 int
 do_write(int fd, const void *buf, size_t nbytes)
 {
-    if (fd < 0 || fd >= NFILES){
-        return -EBADF;
-    }
+        /*************** kernel 2 ***************/
+		file_t *f = fget(fd);
+		if (!f) {
+			return -EBADF;
+		}
 
-    file_t *f = fget(fd);
+		if (!(f->f_mode & FMODE_WRITE) && !(f->f_mode & FMODE_APPEND)) {
+			fput(f);
+			return -EBADF;
+		}
 
-    if (f == NULL){
-        return -EBADF;
-    } else if (!(f->f_mode & FMODE_WRITE)){
-        fput(f);
-        return -EBADF;
-    }
+		/* If append mode, remove to the end of file */
+		if (f->f_mode & FMODE_APPEND) {
+			do_lseek(fd, 0, SEEK_END);
+		}
 
-    if (f->f_vnode->vn_ops->write == NULL){
-        fput(f);
-        return -EISDIR;
-    }
+		int bytes = f->f_vnode->vn_ops->write(f->f_vnode, f->f_pos, buf, nbytes);
+		fput(f);
 
-    if (f->f_mode & FMODE_APPEND){
-        do_lseek(fd, 0, SEEK_END);
-    }
-
-    int bytes_written = f->f_vnode->vn_ops->write(f->f_vnode, f->f_pos, buf, nbytes);
-
-    int ret_val = bytes_written;
-
-    if (bytes_written > 0){
-        int seek_val = do_lseek(fd, bytes_written, SEEK_CUR);
-
-        if (seek_val < 0){
-            ret_val = seek_val;
-        }
-    }
-
-    fput(f);
-    return ret_val;
+		return bytes;
+		/*************** kernel 2 ***************/
 }
 
 /*
@@ -146,18 +134,19 @@ do_write(int fd, const void *buf, size_t nbytes)
 int
 do_close(int fd)
 {
-    if (fd < 0 || fd >= NFILES || curproc->p_files[fd] == NULL){
-        dbg(DBG_VFS, "invalid file descriptor %d. Unable to close file", fd);
-        return -EBADF;
-    }
+        /*************** kernel 2 ***************/
+		if (fd < 0 || fd >= NFILES) {
+			return -EBADF;
+		}
+		file_t *f = curproc->p_files[fd];
+		if (!f) {
+			return -EBADF;
+		}
 
-    file_t *f = curproc->p_files[fd];
-
-    curproc->p_files[fd] = NULL;
-
-    fput(f);
-
-    return 0;
+		curproc->p_files[fd] = NULL;
+		fput(f);
+		return 0;
+		/*************** kernel 2 ***************/
 }
 
 /* To dup a file:
@@ -179,26 +168,21 @@ do_close(int fd)
 int
 do_dup(int fd)
 {
-    dbg(DBG_VFS, "calling do_dup on fd %d\n", fd);
-    if (fd < 0 || fd >= NFILES || curproc->p_files[fd] == NULL){
-        return -EBADF;
-    }
+		/*************** kernel 2 ***************/
+		int nfd = get_empty_fd(curproc);
+		if (nfd == -EMFILE) {
+			return -EMFILE;
+		}
 
-    file_t *f = fget(fd);
-
-    KASSERT(f != NULL && "fd not valid/not open");
-
-    int new_fd = get_empty_fd(curproc);
-
-    if (new_fd < 0){
-        KASSERT(new_fd == -EMFILE);
-        fput(f);
-        return new_fd;
-    }
-
-    curproc->p_files[new_fd] = curproc->p_files[fd];
-
-    return new_fd;
+		file_t* temp_file = fget(fd);
+		/* check if the fd is valid */
+		if (!temp_file) {
+			return -EBADF;
+		}
+        
+		curproc->p_files[nfd] = temp_file;
+        return nfd;
+		/*************** kernel 2 ***************/
 }
 
 /* Same as do_dup, but insted of using get_empty_fd() to get the new fd,
@@ -213,28 +197,23 @@ do_dup(int fd)
 int
 do_dup2(int ofd, int nfd)
 {
-    dbg(DBG_VFS, "calling do_dup2 on ofd %d and nfd %d\n", ofd, nfd);
+		/*************** kernel 2 ***************/		
+		file_t* temp_file = fget(ofd);
+		/* check if the fd is valid */
+		if (!temp_file || nfd < 0 || nfd >= NFILES) {
+			return -EBADF;
+		}
 
-    if (ofd < 0 || ofd >= NFILES || curproc->p_files[ofd] == NULL
-        || nfd < 0 || nfd >= NFILES){
-        return -EBADF;
-    }
+		if (nfd != ofd) {
+			if (curproc->p_files[nfd]) {
+				do_close(nfd);
+			}
 
-    if (ofd == nfd){
-        return ofd;
-    }
+			curproc->p_files[nfd] = temp_file;
+		}
 
-    if (ofd != nfd && curproc->p_files[nfd] != NULL){
-        KASSERT(do_close(nfd) == 0);
-    }
-
-    file_t *f = fget(ofd);
-
-    KASSERT(f != NULL && "fd not valid/not open");
-
-    curproc->p_files[nfd] = f;
-
-    return nfd;
+		return nfd;
+		/*************** kernel 2 ***************/
 }
 
 /*
@@ -265,44 +244,27 @@ do_dup2(int ofd, int nfd)
 int
 do_mknod(const char *path, int mode, unsigned devid)
 {
-    if (mode != S_IFCHR && mode != S_IFBLK){
-        return -EINVAL;
-    }
+        /*************** kernel 2 ***************/
+		if (mode != S_IFCHR || mode != S_IFBLK) {
+			return -EINVAL;
+		}
 
-    size_t namelen;
-    const char *name;
-    vnode_t *dir;
+		vnode_t *dir, *res;
+		size_t namelen;
+		const char *name;
 
-    int dir_result = dir_namev(path, &namelen, &name, NULL, &dir);
+		int rt = dir_namev(path, &namelen, &name, NULL, &dir);
+		if (rt < 0) {
+			/* return the error type from the lower level functions */
+			return rt;
+		}
 
-    switch (dir_result){
-        case -ENOENT:
-        case -ENOTDIR:
-        case -ENAMETOOLONG:
-            return dir_result;
-        default:
-            /* do nothing */;
-    }
+		if (!lookup(dir, name, namelen, &res)) {
+			return -EEXIST;
+		}
 
-    KASSERT(dir_result == 0);
-
-    vnode_t *base_node;
-    int lookup_result = lookup(dir, name, namelen, &base_node);
-
-    int ret_code;
-
-    if (lookup_result == -ENOTDIR){
-        ret_code = -ENOTDIR;
-    } else if (lookup_result == 0){
-        /* the file already exists */
-        vput(base_node);
-        ret_code = -EEXIST;
-    } else {
-        ret_code = dir->vn_ops->mknod(dir, name, namelen, mode, devid);
-    }
-
-    vput(dir);
-    return ret_code;
+		return dir->vn_ops->mknod(dir, name, namelen, mode, devid);
+		/*************** kernel 2 ***************/
 }
 
 /* Use dir_namev() to find the vnode of the dir we want to make the new
@@ -322,39 +284,23 @@ do_mknod(const char *path, int mode, unsigned devid)
 int
 do_mkdir(const char *path)
 {
-    size_t namelen;
-    const char *name;
-    vnode_t *dir;
+		/*************** kernel 2 ***************/
+		vnode_t * dir, * res;
+		size_t namelen;
+		const char * name;
 
-    int dir_result = dir_namev(path, &namelen, &name, NULL, &dir);
+		int rt = dir_namev(path, &namelen, &name, NULL, &dir);
+		if (rt < 0) {
+			/* return the error type from the lower level functions */
+			return rt;
+		}
+	
+		if (lookup(dir, name, namelen, &res) == 0) {
+			return -EEXIST;
+		}
 
-    switch (dir_result){
-        case -ENOENT:
-        case -ENOTDIR:
-        case -ENAMETOOLONG:
-        case -EINVAL:
-            return dir_result;
-        default:
-            /* do nothing */;
-    }
-
-    vnode_t *base_node;
-    int lookup_result = lookup(dir, name, namelen, &base_node);
-
-    int ret_code;
-
-    if (lookup_result == -ENOTDIR){
-        ret_code = -ENOTDIR;
-    } if (lookup_result == 0){
-        /* the file already exists */
-        vput(base_node);
-        ret_code = -EEXIST;
-    } else {
-        KASSERT(lookup_result == -ENOENT);
-        ret_code = dir->vn_ops->mkdir(dir, name, namelen);
-    } 
-    vput(dir);
-    return ret_code;
+		return dir->vn_ops->mkdir(dir, name, namelen);
+		/*************** kernel 2 ***************/
 }
 
 /* Use dir_namev() to find the vnode of the directory containing the dir to be
@@ -378,41 +324,36 @@ do_mkdir(const char *path)
 int
 do_rmdir(const char *path)
 {
-    size_t namelen;
-    const char *name;
-    vnode_t *dir;
+        /*************** kernel 2 ***************/
+		vnode_t * dir, * res;
+		size_t namelen;
+		const char * name;
 
-    int dn_res = dir_namev(path, &namelen, &name, NULL, &dir);
+		int rt = dir_namev(path, &namelen, &name, NULL, &dir); 
+		if (rt < 0) {
+			/* return the error type from the lower level functions */
+			return rt;
+		}
+	
+		if (lookup(dir, name, namelen, &res) < 0) {
+			return -ENOENT;
+		}
+	
+		if (res->vn_mode != S_IFDIR) {
+			return -ENOTDIR;
+		}
 
-    if (dn_res < 0){
-        dbg(DBG_VFS, "dir_namev failed\n");
-        return dn_res;
-    }
+		/* need to handle the first two errors */
+		if (!strncmp(name, ".", namelen)) {
+			return -EINVAL;
+		}
+	
+		if (!strncmp(name, "..", namelen)) {
+			return -ENOTEMPTY;
+		}
 
-    int to_ret;
-    vnode_t *lookup_vn;
-    int lookup_res;
-
-    if (namelen == 1 && name[0] == '.'){
-        to_ret = -EINVAL;
-    } else if (namelen == 2 && name[0] == '.' && name[1] == '.'){
-        to_ret = -ENOTEMPTY;
-    } else if (dir->vn_ops->rmdir == NULL){
-        to_ret = -ENOTDIR;
-    } else if ((lookup_res = lookup(dir, name, namelen, &lookup_vn)) != 0){
-        /*probably because the dir doesn't exist */
-        to_ret = lookup_res;
-    } else if (lookup_vn->vn_ops->rmdir == NULL){
-        to_ret = -ENOTDIR;
-        vput(lookup_vn);
-    } else {
-        to_ret = dir->vn_ops->rmdir(dir, name, namelen);
-        vput(lookup_vn);
-    }
-
-    vput(dir);
-
-    return to_ret;
+		return dir->vn_ops->unlink(dir, name, namelen);
+		/*************** kernel 2 ***************/
 }
 
 /*
@@ -431,36 +372,27 @@ do_rmdir(const char *path)
 int
 do_unlink(const char *path)
 {
-    size_t namelen;
-    const char *name;
-    vnode_t *dir;
+        /*************** kernel 2 ***************/
+		vnode_t * dir, * res;
+		size_t namelen;
+		const char * name;
 
-    int dn_res = dir_namev(path, &namelen, &name, NULL, &dir);
+		int rt = dir_namev(path, &namelen, &name, NULL, &dir); 
+		if (rt < 0) {
+			/* return the error type from the lower level functions */
+			return rt;
+		}
+	
+		if (lookup(dir, name, namelen, &res) < 0) {
+			return -ENOENT;
+		}
+	
+		if (res->vn_mode == S_IFDIR) {
+			return -EISDIR;
+		}
 
-    if (dn_res < 0){
-        dbg(DBG_VFS, "dir_namev failed\n");
-        return dn_res;
-    }
-
-    int to_ret;
-    vnode_t *lookup_vn;
-    int lookup_res;
-
-    if (dir->vn_ops->unlink == NULL){
-        to_ret = -ENOTDIR;
-    } else if ((lookup_res = lookup(dir, name, namelen, &lookup_vn)) != 0){
-        /* probably because the file doesn't exist */
-        to_ret = lookup_res;
-    } else if (lookup_vn->vn_ops->rmdir != NULL){
-        to_ret = -EISDIR;
-        vput(lookup_vn);
-    } else {
-        to_ret = dir->vn_ops->unlink(dir, name, namelen);
-        vput(lookup_vn);
-    }
-
-    vput(dir);
-    return to_ret;
+		return dir->vn_ops->unlink(dir, name, namelen);
+		/*************** kernel 2 ***************/
 }
 
 /* To link:
@@ -481,46 +413,40 @@ do_unlink(const char *path)
  *        directory.
  *      o ENAMETOOLONG
  *        A component of from or to was too long.
+ *      o EISDIR
+ *        from is a directory.
  */
 int
 do_link(const char *from, const char *to)
 {
-    vnode_t *from_vn;
+		/*************** kernel 2 ***************/
+		vnode_t * dir_to, * res_to, * res_from;
+		size_t namelen;
+		const char * name;
 
-    int on_res = open_namev(from, O_RDONLY, &from_vn, NULL);
+		int rt = open_namev(from, NULL, &res_from, NULL);
+		vput(res_from);
 
-    if (on_res < 0){
-        dbg(DBG_VFS, "open_namev failed\n");
-        return on_res;
-    }
+		if (rt < 0) {
+			return rt;
+		}
 
-    size_t namelen;
-    const char *name;
-    vnode_t *to_vn;
+		if (res_from->vn_mode == S_IFDIR) {
+			return -EISDIR;
+		}
 
-    int dn_res = dir_namev(to, &namelen, &name, NULL, &to_vn);
+		rt = dir_namev(to, &namelen, &name, NULL, &dir_to);
+		vput(dir_to);
+		if (rt < 0) {
+			return rt;
+		}
 
-    if (dn_res < 0){
-        dbg(DBG_VFS, "dir_namev failed\n");
-        vput(from_vn);
-        return dn_res;
-    }
+		if (lookup(dir_to, name, namelen, &res_to) == 0) {
+			return -EEXIST;
+		}
 
-    int to_ret;
-    vnode_t *lookup_vn;
-
-    if (to_vn->vn_ops->link == NULL){
-        return -ENOTDIR;
-    } else if (lookup(to_vn, name, namelen, &lookup_vn) == 0){
-        vput(lookup_vn);
-        to_ret = -EEXIST;
-    } else {
-        to_ret = to_vn->vn_ops->link(from_vn, to_vn, name, namelen);
-    }
-
-    vput(to_vn);
-    vput(from_vn);
-    return to_ret;
+        return  dir_to->vn_ops->link(res_from, dir_to, name, namelen);
+		/*************** kernel 2 ***************/
 }
 
 /*      o link newname to oldname
@@ -534,14 +460,14 @@ do_link(const char *from, const char *to)
 int
 do_rename(const char *oldname, const char *newname)
 {
-    int link_res = do_link(oldname, newname);
+		/*************** kernel 2 ***************/
+        int rt = do_link(oldname, newname);
+		if (rt < 0) {
+			return rt;
+		}
 
-    if (link_res < 0){
-        dbg(DBG_VFS, "do_link failed\n");
-        return link_res;
-    }
-
-    return do_unlink(oldname);
+		return do_unlink(oldname);
+		/*************** kernel 2 ***************/
 }
 
 /* Make the named directory the current process's cwd (current working
@@ -560,28 +486,26 @@ do_rename(const char *oldname, const char *newname)
 int
 do_chdir(const char *path)
 {
-    vnode_t *new_wd;
+		/*************** kernel 2 ***************/
+		vnode_t *dir, *res;
+		size_t namelen;
+		const char *name;
 
-    int open_namev_res = open_namev(path, O_RDONLY, &new_wd, NULL);
+		int rt = open_namev(path, 0, &dir, NULL);
+		if (rt < 0) {
+			return rt;
+		}
 
-    if (open_namev_res < 0){
-        dbg(DBG_VFS, "do_chdir failed with error %d\n", open_namev_res);
-        return open_namev_res;
-    }
+		vnode_t *old_node = curproc->p_cwd;
+		vput(old_node);
+		curproc->p_cwd = dir;
 
-    if (new_wd->vn_ops->mkdir == NULL){
-        vput(new_wd);
-        return -ENOTDIR;
-    }
-    
-    vput(curproc->p_cwd);
-    curproc->p_cwd = new_wd;
-
-    return 0;
+		return 0;
+		/*************** kernel 2 ***************/
 }
 
-/* Call the readdir f_op on the given fd, filling in the given dirent_t*.
- * If the readdir f_op is successful, it will return a positive value which
+/* Call the readdir fs_op on the given fd, filling in the given dirent_t*.
+ * If the readdir fs_op is successful, it will return a positive value which
  * is the number of bytes copied to the dirent_t.  You need to increment the
  * file_t's f_pos by this amount.  As always, be aware of refcounts, check
  * the return value of the fget and the virtual function, and be sure the
@@ -598,35 +522,32 @@ do_chdir(const char *path)
 int
 do_getdent(int fd, struct dirent *dirp)
 {
-    if (fd < 0 || fd >= NFILES){
-        return -EBADF;
-    }
+        /*************** kernel 2 ***************/
+        if (fd < 0 || fd >= NFILES) {
+			return -EBADF;
+		}
+		
+		file_t *f = fget(fd);
+		if (!f) {
+			return -EBADF;
+		}
 
-    file_t *f = fget(fd);
+		if (f->f_vnode->vn_mode != S_IFDIR) {
+			return -ENOTDIR;
+		}
 
-    if (f == NULL){
-        return -EBADF;
-    }
-
-    if (f->f_vnode->vn_ops->readdir == NULL){
-        fput(f);
-        return -ENOTDIR;
-    }
-
-    int readdir_res = f->f_vnode->vn_ops->readdir(f->f_vnode, f->f_pos, dirp);
-
-    /* if the call to readdir() failed */
-    if (readdir_res < 1){
-        fput(f);
-        return readdir_res;
-    }
-
-    int seek_result = do_lseek(fd, readdir_res, SEEK_CUR);
-
-    fput(f);
-    
-    dbg(DBG_VFS, "casting from unsigned to signed int...\n");
-    return (seek_result > -1) ? (signed) sizeof(dirent_t) : seek_result;
+		vnode_t *dir = f->f_vnode;
+		int rt = dir->vn_ops->readdir(dir, f->f_pos, dirp);
+		f->f_pos += rt;
+		if (rt <= 0) {
+			fput(f);
+			return rt;
+		}
+		else {
+			fput(f);
+			return sizeof(dirent_t);
+		}
+		/*************** kernel 2 ***************/
 }
 
 /*
@@ -642,30 +563,34 @@ do_getdent(int fd, struct dirent *dirp)
 int
 do_lseek(int fd, int offset, int whence)
 {
-    if (fd < 0 || fd >= NFILES){
-        return -EBADF;
-    }
+        /*************** kernel 2 ***************/
+		if (whence != SEEK_SET && whence != SEEK_CUR && whence != SEEK_END) {
+			return -EINVAL;
+		}
+		
+		file_t *f = fget(fd);
+		if (!f) {
+			return -EBADF;
+		}
+		
+		int fptr;
+		if (whence == SEEK_SET) {
+			fptr = offset;
+		}
+		if (whence == SEEK_CUR) {
+			fptr = f->f_pos + offset;  
+		}
+		if (whence == SEEK_END) {
+			fptr = f->f_vnode->vn_len;
+		}
 
-    file_t *f = fget(fd);
-
-    if (f == NULL){
-        return -EBADF;
-    }   
-
-    if (whence == SEEK_SET && offset >= 0){
-        f->f_pos = offset;
-    } else if (whence == SEEK_CUR && f->f_pos + offset >= 0){
-        f->f_pos += offset;
-    } else if (whence == SEEK_END && f->f_vnode->vn_len + offset >= 0){
-        f->f_pos = f->f_vnode->vn_len + offset;
-    } else {
-        fput(f);
-        return -EINVAL;
-    }
-
-    int ret_val = f->f_pos;
-    fput(f);
-    return ret_val;
+		if (fptr < 0 || fptr > f->f_vnode->vn_len) {
+			return -1;
+		} else {
+			f->f_pos = fptr;
+			return fptr;
+		}
+		/*************** kernel 2 ***************/
 }
 
 /*
@@ -682,19 +607,22 @@ do_lseek(int fd, int offset, int whence)
 int
 do_stat(const char *path, struct stat *buf)
 {
-    vnode_t *vn;
+		/*************** kernel 2 ***************/
+		vnode_t * dir, * res;
+		size_t namelen;
+		const char * name;
 
-    int result = open_namev(path, O_RDONLY, &vn, NULL);
+		int rt = dir_namev(path, &namelen, &name, NULL, &dir);
+		if (rt < 0) {
+			return rt;
+		}
+		
+		if (lookup(dir, name, namelen, &res) < 0) {
+			return -ENOENT;
+		}
 
-    if (result < 0){
-        dbg(DBG_VFS, "do_stat failed because open_namev returned %d\n", result);
-        return result;
-    }
-
-    int stat_result = vn->vn_ops->stat(vn, buf);
-
-    vput(vn);
-    return result;
+        return dir->vn_ops->stat(res, buf);
+		/*************** kernel 2 ***************/
 }
 
 #ifdef __MOUNTING__
